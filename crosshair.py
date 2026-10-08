@@ -257,12 +257,17 @@ window.addEventListener("resize", resize);
 resize();
 let state = null;
 function draw() {
+  const dpr = window.devicePixelRatio || 1;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   const w = window.innerWidth;
   const h = window.innerHeight;
   ctx.clearRect(0, 0, w, h);
   if (!state || !state.visible) return;
   const cx = w / 2;
   const cy = h / 2;
+  ctx.translate(cx, cy);
+  ctx.scale(2, 2);
+  ctx.translate(-cx, -cy);
   ctx.globalAlpha = (state.alpha || 255) / 255;
   ctx.fillStyle = state.color || "#00ff00";
   ctx.strokeStyle = state.color || "#00ff00";
