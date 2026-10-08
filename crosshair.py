@@ -8,9 +8,12 @@
 от администратора — иначе Windows не даст окну остаться сверху.
 """
 
+import json
+import os
 import sys
 import ctypes
 from ctypes import wintypes
+from pathlib import Path
 
 user32 = ctypes.windll.user32
 
@@ -119,6 +122,77 @@ def key_down(vk):
     return bool(user32.GetAsyncKeyState(vk) & 0x8000)
 
 
+_SHAPES = ("Круг", "Перекрестие")
+
+
+def _settings_path():
+    base = os.environ.get("APPDATA") or str(Path.home())
+    return Path(base) / "Прицел" / "settings.json"
+
+
+def _default_settings():
+    return {
+        "shape": "Круг",
+        "size": 6,
+        "alpha": 230,
+        "color": "#00ff00",
+        "hide_on_aim": True,
+    }
+
+
+def _as_int(value, low, high):
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    if low <= number <= high:
+        return number
+    return None
+
+
+def load_settings():
+    data = _default_settings()
+    try:
+        raw = json.loads(_settings_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return data
+    if not isinstance(raw, dict):
+        return data
+
+    if raw.get("shape") in _SHAPES:
+        data["shape"] = raw["shape"]
+    size = _as_int(raw.get("size"), 2, 40)
+    if size is not None:
+        data["size"] = size
+    alpha = _as_int(raw.get("alpha"), 20, 255)
+    if alpha is not None:
+        data["alpha"] = alpha
+    color = QColor(str(raw.get("color", "")))
+    if color.isValid():
+        data["color"] = color.name()
+    if isinstance(raw.get("hide_on_aim"), bool):
+        data["hide_on_aim"] = raw["hide_on_aim"]
+    return data
+
+
+def save_settings(overlay):
+    payload = {
+        "shape": overlay.shape_type if overlay.shape_type in _SHAPES else "Круг",
+        "size": int(overlay.dot_size),
+        "alpha": int(overlay.alpha),
+        "color": QColor(overlay.color).name(),
+        "hide_on_aim": bool(overlay.hide_on_aim),
+    }
+    path = _settings_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(path)
+    except OSError:
+        return
+
+
 def _hwnd_of(widget):
     value = widget.winId()
     return int(value) if value else 0
@@ -159,13 +233,15 @@ class CrosshairOverlay(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.shape_type = "Круг"
-        self.dot_size = 6
-        self.color = QColor(0, 255, 0)
-        self.alpha = 230
+        saved = load_settings()
+        self.shape_type = saved["shape"]
+        self.dot_size = saved["size"]
+        self.color = QColor(saved["color"])
+        self.alpha = saved["alpha"]
 
         self.user_enabled = True
-        self.hide_on_aim = True
+        self.hide_on_aim = saved["hide_on_aim"]
+        self._remember = False
         self.rmb_held = key_down(VK_RBUTTON)
         self._drawing = self._should_draw()
         self._status = self.status_text()
@@ -193,9 +269,14 @@ class CrosshairOverlay(QWidget):
         self.setWindowTitle("Прицел")
 
         self._relayout()
+        self._remember = True
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._poll)
+
+    def _remember_settings(self):
+        if self._remember:
+            save_settings(self)
 
     def ignore_widget(self, widget):
         self._ignored_widgets.append(widget)
@@ -346,6 +427,7 @@ class CrosshairOverlay(QWidget):
         self.hide_on_aim = enabled
         self.hide_on_aim_changed.emit(enabled)
         self._refresh_visual()
+        self._remember_settings()
 
     def toggle_hide_on_aim(self):
         self.set_hide_on_aim(not self.hide_on_aim)
@@ -375,22 +457,37 @@ class CrosshairOverlay(QWidget):
             callback()
 
     def set_shape(self, name):
+        if name not in _SHAPES or name == self.shape_type:
+            return
         self.shape_type = name
         self._relayout()
         self.update()
+        self._remember_settings()
 
     def set_size(self, value):
+        value = _as_int(value, 2, 40)
+        if value is None or value == self.dot_size:
+            return
         self.dot_size = value
         self._relayout()
         self.update()
+        self._remember_settings()
 
     def set_alpha(self, value):
+        value = _as_int(value, 20, 255)
+        if value is None or value == self.alpha:
+            return
         self.alpha = value
         self.update()
+        self._remember_settings()
 
     def set_color(self, color):
+        color = QColor(color)
+        if not color.isValid() or color.name() == self.color.name():
+            return
         self.color = color
         self.update()
+        self._remember_settings()
 
 
 class SettingsWindow(QWidget):
@@ -409,7 +506,10 @@ class SettingsWindow(QWidget):
 
         layout.addWidget(QLabel("Тип прицела:"))
         self.combo_type = QComboBox()
-        self.combo_type.addItems(["Круг", "Перекрестие"])
+        self.combo_type.addItems(list(_SHAPES))
+        shape_index = self.combo_type.findText(self.overlay.shape_type)
+        if shape_index >= 0:
+            self.combo_type.setCurrentIndex(shape_index)
         self.combo_type.currentTextChanged.connect(self.overlay.set_shape)
         layout.addWidget(self.combo_type)
 
@@ -451,6 +551,7 @@ class SettingsWindow(QWidget):
             "F6 — показать или скрыть прицел\n"
             "F7 — это окно\n"
             "F8 — скрытие по ПКМ вкл/выкл\n"
+            "Настройки запоминаются между запусками\n"
             "Игра: оконный или безрамочный режим"
         )
         hint.setStyleSheet("color: gray; font-size: 11px;")
@@ -536,6 +637,7 @@ def main():
     app.setApplicationName("Прицел")
 
     overlay = CrosshairOverlay()
+    app.aboutToQuit.connect(lambda: save_settings(overlay))
     settings = SettingsWindow(overlay)
     overlay.ignore_widget(settings)
     overlay.on_toggle_settings = settings.toggle_settings
