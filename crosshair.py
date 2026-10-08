@@ -6,13 +6,19 @@
 полноэкранный режим рисует поверх всех обычных окон, и прицел туда не попадёт.
 Если игра запущена от имени администратора, этот скрипт тоже нужно запустить
 от администратора — иначе Windows не даст окну остаться сверху.
+
+В OBS прицел берётся отдельным источником «Браузер» (адрес печатается в окне
+настроек). Захват всего экрана для этого не нужен: игру добавляйте своим
+источником «Захват игры», прицел ляжет поверх в сцене.
 """
 
 import json
 import os
 import sys
 import ctypes
+import threading
 from ctypes import wintypes
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 user32 = ctypes.windll.user32
@@ -227,6 +233,132 @@ def _screen_for_point(px, py):
     return best
 
 
+_OBS_PAGE = """<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; background: transparent; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.round(window.innerWidth * dpr);
+  canvas.height = Math.round(window.innerHeight * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener("resize", resize);
+resize();
+let state = null;
+function draw() {
+  const dpr = window.devicePixelRatio || 1;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const w = window.innerWidth;
+  const h = window.innerHeight;
+  ctx.clearRect(0, 0, w, h);
+  if (!state || !state.visible) return;
+  const cx = w / 2;
+  const cy = h / 2;
+  ctx.translate(cx, cy);
+  ctx.scale(2, 2);
+  ctx.translate(-cx, -cy);
+  ctx.globalAlpha = (state.alpha || 255) / 255;
+  ctx.fillStyle = state.color || "#00ff00";
+  ctx.strokeStyle = state.color || "#00ff00";
+  if (state.shape === "Круг") {
+    ctx.beginPath();
+    ctx.arc(cx, cy, (state.size || 6) / 2, 0, Math.PI * 2);
+    ctx.fill();
+  } else {
+    const radius = state.size || 6;
+    let gap = Math.min(4, radius * 0.35);
+    if (gap < 1.5) gap = 0;
+    ctx.lineWidth = radius >= 8 ? 2 : 1;
+    ctx.lineCap = "butt";
+    ctx.beginPath();
+    ctx.moveTo(cx - radius, cy); ctx.lineTo(cx - gap, cy);
+    ctx.moveTo(cx + gap, cy); ctx.lineTo(cx + radius, cy);
+    ctx.moveTo(cx, cy - radius); ctx.lineTo(cx, cy - gap);
+    ctx.moveTo(cx, cy + gap); ctx.lineTo(cx, cy + radius);
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+}
+async function poll() {
+  try {
+    const response = await fetch("/state", { cache: "no-store" });
+    state = await response.json();
+    draw();
+  } catch (e) {}
+}
+setInterval(poll, 50);
+poll();
+</script>
+</body>
+</html>
+"""
+
+
+class _ObsHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        if path == "/state":
+            body = json.dumps(self.server.bridge.snapshot(), ensure_ascii=False).encode("utf-8")
+            content_type = "application/json; charset=utf-8"
+        elif path in ("/", "/crosshair.html"):
+            body = _OBS_PAGE.encode("utf-8")
+            content_type = "text/html; charset=utf-8"
+        else:
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        return
+
+
+class ObsBrowserBridge:
+    """Локальная страница с тем же прицелом. OBS берёт её источником «Браузер»."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._state = {
+            "shape": "Круг",
+            "size": 6,
+            "alpha": 230,
+            "color": "#00ff00",
+            "visible": True,
+        }
+        self.url = ""
+        self._httpd = None
+
+    def update(self, **fields):
+        with self._lock:
+            self._state.update(fields)
+
+    def snapshot(self):
+        with self._lock:
+            return dict(self._state)
+
+    def start(self):
+        self._httpd = ThreadingHTTPServer(("127.0.0.1", 0), _ObsHandler)
+        self._httpd.bridge = self
+        port = self._httpd.server_address[1]
+        self.url = f"http://127.0.0.1:{port}/"
+        threading.Thread(target=self._httpd.serve_forever, daemon=True).start()
+
+
 class CrosshairOverlay(QWidget):
     status_changed = pyqtSignal(str)
     hide_on_aim_changed = pyqtSignal(bool)
@@ -412,6 +544,19 @@ class CrosshairOverlay(QWidget):
                 apply_overlay_style(_hwnd_of(self))
         elif self.isVisible():
             self.hide()
+        self._push_obs()
+
+    def _push_obs(self):
+        bridge = getattr(self, "obs_bridge", None)
+        if bridge is None:
+            return
+        bridge.update(
+            shape=self.shape_type,
+            size=int(self.dot_size),
+            alpha=int(self.alpha),
+            color=QColor(self.color).name(),
+            visible=bool(self._drawing),
+        )
 
     def set_enabled(self, enabled):
         self.user_enabled = bool(enabled)
@@ -491,9 +636,10 @@ class CrosshairOverlay(QWidget):
 
 
 class SettingsWindow(QWidget):
-    def __init__(self, overlay: CrosshairOverlay):
+    def __init__(self, overlay: CrosshairOverlay, obs_url=""):
         super().__init__()
         self.overlay = overlay
+        self._obs_url = obs_url
         self._force_close = False
         self._build()
 
@@ -557,6 +703,20 @@ class SettingsWindow(QWidget):
         hint.setStyleSheet("color: gray; font-size: 11px;")
         layout.addWidget(hint)
 
+        if self._obs_url:
+            obs = QLabel(
+                "OBS: источник «Браузер», размер 200×200, по центру сцены.\n"
+                "Игру захватывайте отдельно. Экран целиком не нужен.\n"
+                + self._obs_url
+            )
+            obs.setWordWrap(True)
+            obs.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            obs.setStyleSheet("color: gray; font-size: 11px;")
+            layout.addWidget(obs)
+            copy_obs = QPushButton("Копировать адрес для OBS")
+            copy_obs.clicked.connect(self._copy_obs_url)
+            layout.addWidget(copy_obs)
+
         self.setLayout(layout)
         self.adjustSize()
         self.setFixedHeight(self.sizeHint().height() + 8)
@@ -600,6 +760,9 @@ class SettingsWindow(QWidget):
             self.overlay.set_color(color)
             self._paint_color_button()
 
+    def _copy_obs_url(self):
+        QApplication.clipboard().setText(self._obs_url)
+
     def toggle_settings(self):
         if self.isVisible():
             self.hide()
@@ -637,8 +800,12 @@ def main():
     app.setApplicationName("Прицел")
 
     overlay = CrosshairOverlay()
+    obs_bridge = ObsBrowserBridge()
+    overlay.obs_bridge = obs_bridge
+    overlay._push_obs()
+    obs_bridge.start()
     app.aboutToQuit.connect(lambda: save_settings(overlay))
-    settings = SettingsWindow(overlay)
+    settings = SettingsWindow(overlay, obs_bridge.url)
     overlay.ignore_widget(settings)
     overlay.on_toggle_settings = settings.toggle_settings
 
