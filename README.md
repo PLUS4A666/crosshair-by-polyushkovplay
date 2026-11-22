@@ -1,5 +1,6 @@
 # POLYCRHAIR
 ### by POLYUSHKOV PLAY
+100% code is Ai.
 
 <p align="center">
   <strong>Настраиваемый игровой прицел для STALZONE и OBS Studio</strong>
